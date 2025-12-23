@@ -1,0 +1,25 @@
+{
+    "content": "[]",
+    "creation": "2024-01-18 12:21:28.998348",
+    "docstatus": 0,
+    "doctype": "Page",
+    "idx": 0,
+    "modified": "2024-01-18 12:21:28.998348",
+    "modified_by": "Administrator",
+    "module": "Pathohub",
+    "name": "franchisee",
+    "owner": "Administrator",
+    "page_name": "franchisee",
+    "roles": [
+        {
+            "role": "System Manager"
+        },
+        {
+            "role": "Franchisee"
+        }
+    ],
+    "script": null,
+    "standard": "Yes",
+    "style": null,
+    "system_page": 0
+}
