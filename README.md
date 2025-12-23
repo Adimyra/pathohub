@@ -20,6 +20,7 @@ This app uses `pre-commit` for code formatting and linting. Please [install pre-
 cd apps/pathohub
 pre-commit install
 ```
+test
 
 Pre-commit is configured to use the following tools for checking and formatting your code:
 
