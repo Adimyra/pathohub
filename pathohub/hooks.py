@@ -25,7 +25,10 @@ app_license = "mit"
 # ------------------
 
 # include js, css files in header of desk.html
-# app_include_css = "/assets/pathohub/css/pathohub.css"
+app_include_css = [
+ 	"/assets/pathohub/css/pathohub.css",
+ 	"/assets/pathohub/css/pathohub_tailwind.css"
+]
 # app_include_js = "/assets/pathohub/js/pathohub.js"
 
 # include js, css files in header of web template

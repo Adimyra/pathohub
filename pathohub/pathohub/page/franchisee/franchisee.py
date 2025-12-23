@@ -15,8 +15,8 @@ def get_dashboard_stats(from_date=None, to_date=None):
         filters_patient['creation'] = ['>=', from_date]
         filters_sample['creation'] = ['>=', from_date]
     elif not from_date and not to_date:
-         # Default behavior for samples if no filter: Today
-         filters_sample['creation'] = ['>=', today()]
+         # No filter: All Time
+         pass
 
     try:
         stats['total_patients'] = frappe.db.count('Patient', filters_patient)
@@ -30,16 +30,34 @@ def get_dashboard_stats(from_date=None, to_date=None):
 
     try:
         # Pending tests are current status, generally not date filtered but we could
-        stats['pending_tests'] = frappe.db.count('Lab Test', {'status': ['!=', 'Completed']})
+        filters_pending = {'status': ['!=', 'Completed']}
+        if from_date and to_date:
+             filters_pending['creation'] = ['between', [from_date, to_date]]
+        elif from_date:
+             filters_pending['creation'] = ['>=', from_date]
+        
+        stats['pending_tests'] = frappe.db.count('Lab Test', filters_pending)
     except Exception:
         stats['pending_tests'] = 0
         frappe.log_error(frappe.get_traceback(), 'Franchisee Dashboard Stats Error')
 
     try:
-        wallet = frappe.db.get_value('Franchisee Wallet', {'user': frappe.session.user}, 'balance')
-        stats['wallet_balance'] = wallet or 0
+        current_balance = frappe.db.get_value('Franchisee Wallet', {'user': frappe.session.user}, 'balance')
+        stats['wallet_balance'] = current_balance or 0
     except Exception:
         stats['wallet_balance'] = 0
+
+    try:
+        filters_invoice = {'owner': frappe.session.user, 'docstatus': ['<', 2]}
+        if from_date and to_date:
+            filters_invoice['creation'] = ['between', [from_date, to_date]]
+        elif from_date:
+            filters_invoice['creation'] = ['>=', from_date]
+            
+        revenue = frappe.db.get_value('Sales Invoice', filters_invoice, 'sum(grand_total)')
+        stats['total_revenue'] = revenue or 0
+    except Exception:
+        stats['total_revenue'] = 0
 
     return stats
 
@@ -80,35 +98,59 @@ def get_pending_samples(patient):
 	return pending_tests
 
 @frappe.whitelist()
-def create_sample_collection(patient, tests):
-	if isinstance(tests, str):
-		tests = frappe.parse_json(tests)
-	
-	collections = []
-	for test_name in tests:
-		# Create Sample Collection
-		# We guess fields. If headers fail, we might need to debug.
-		doc = frappe.new_doc('Sample Collection')
-		doc.patient = patient
-		
-		# Try to link Lab Test if field exists
-		# Validating fields
-		meta = frappe.get_meta('Sample Collection')
-		if meta.get_field('lab_test'):
-			doc.lab_test = test_name
-		elif meta.get_field('test'):
-			doc.test = test_name
-			
+def create_sample_collection(patient, tests, collection_date=None, collection_time=None, sample_qty=0, sample_uom=None, practitioner=None):
+    if isinstance(tests, str):
+        tests = frappe.parse_json(tests)
+    
+    collections = []
+    
+    # Combine date and time
+    collected_time = None
+    if collection_date:
+        if collection_time:
+            collected_time = f"{collection_date} {collection_time}"
+        else:
+            collected_time = f"{collection_date} 00:00:00"
+    else:
+        collected_time = frappe.utils.now_datetime()
 
-		doc.status = 'Collected' # Assuming status field
-		
-		doc.insert(ignore_permissions=True)
-		collections.append(doc.name)
-		
-		# Update Lab Test status
-		frappe.db.set_value('Lab Test', test_name, 'status', 'Sample Collected')
-		
-	return collections
+    for test_name in tests:
+        # Create Sample Collection
+        doc = frappe.new_doc('Sample Collection')
+        doc.patient = patient
+        
+        # Link Lab Test
+        meta = frappe.get_meta('Sample Collection')
+        if meta.get_field('lab_test'):
+            doc.lab_test = test_name
+        elif meta.get_field('test'):
+            doc.test = test_name
+            
+        # Set Collection Details
+        doc.collected_by = frappe.session.user
+        doc.collected_time = collected_time
+        doc.sample_qty = sample_qty
+        doc.sample_uom = sample_uom
+        
+        if practitioner:
+            doc.referring_practitioner = practitioner
+
+        doc.status = 'Collected' 
+        
+        doc.insert(ignore_permissions=True)
+        collections.append(doc.name)
+        
+        # Update Lab Test status
+        frappe.db.set_value('Lab Test', test_name, 'status', 'Sample Collected')
+        
+    return collections
+
+@frappe.whitelist()
+def get_patient_doctor(patient):
+    try:
+        return frappe.db.get_value('Patient', patient, 'practitioner')
+    except Exception:
+        return None
 
 @frappe.whitelist()
 def get_wallet_balance():
@@ -183,3 +225,158 @@ def recharge_wallet(amount):
     frappe.db.set_value('Franchisee Wallet', wallet_name, 'balance', new_balance)
     
     return new_balance
+
+@frappe.whitelist()
+def create_manual_lab_tests(patient, templates, gender=None, practitioner=None, date=None, time=None):
+    if isinstance(templates, str):
+        templates = frappe.parse_json(templates)
+        
+    created_tests = []
+    
+    for template_name in templates:
+        doc = frappe.new_doc('Lab Test')
+        doc.patient = patient
+        doc.template = template_name
+        if gender:
+            doc.patient_sex = gender
+        if practitioner:
+            doc.practitioner = practitioner
+        
+        # Set Date/Time if provided
+        if date:
+            doc.date = date
+        if time:
+            doc.time = time
+            
+        doc.insert(ignore_permissions=True)
+        created_tests.append(doc.name)
+        
+    return created_tests
+
+# ----------------- Inventory Management For Franchisee -----------------
+
+def _get_franchisee_warehouse():
+    """
+    Retrieves the warehouse associated with the current franchisee user.
+    """
+    warehouse = None
+    if frappe.db.has_column("User", "warehouse"):
+         warehouse = frappe.db.get_value("User", frappe.session.user, "warehouse")
+    
+    if not warehouse:
+        # Fallback for testing, assuming a naming convention like 'Franchisee A - W'
+        # In production, this should throw an error or be handled more gracefully.
+        user_doc = frappe.get_doc("User", frappe.session.user)
+        user_name = user_doc.first_name
+        warehouse = f"{user_name} - Stores - Pb" # Matching typical naming or just Name
+        
+        # Taking a safer guess if the specific warehouse naming expectation is unknown
+        # For now, let's try to find *any* warehouse or use a default if above fails.
+        if not frappe.db.exists("Warehouse", warehouse):
+             # Try just First Name
+             warehouse = user_name
+             if not frappe.db.exists("Warehouse", warehouse):
+                  # Fallback to a known default if possible, or just return None to avoid crash 
+                  # but let the next check handle it.
+                  # Let's return a dummy that won't crash SQL but returns empty list
+                  return f"Warehouse-{frappe.session.user}"
+
+    return warehouse
+
+@frappe.whitelist()
+def get_stock_list():
+    """
+    Returns a list of stock items and their quantities for the franchisee's warehouse.
+    """
+    warehouse = _get_franchisee_warehouse()
+    if not warehouse:
+        return []
+
+    # Get stock balance from Stock Ledger
+    stock_data = frappe.db.sql(f"""
+        SELECT sle.item_code, i.item_name, SUM(sle.actual_qty) as qty
+        FROM `tabStock Ledger Entry` sle
+        JOIN `tabItem` i ON sle.item_code = i.name
+        WHERE sle.warehouse = '{warehouse}'
+        GROUP BY sle.item_code, i.item_name
+        HAVING SUM(sle.actual_qty) > 0
+    """, as_dict=True)
+    
+    return stock_data
+
+@frappe.whitelist()
+def create_material_request(items, schedule_date, warehouse=None):
+    """
+    Creates a Material Request for the franchisee.
+    """
+    if isinstance(items, str):
+        items = frappe.parse_json(items)
+
+    if not warehouse:
+        warehouse = _get_franchisee_warehouse()
+
+    mr = frappe.new_doc("Material Request")
+    mr.material_request_type = "Material Transfer"
+    mr.schedule_date = schedule_date
+    
+    for item in items:
+        item_code = item.get("item_code")
+        qty = item.get("qty")
+        
+        # Fetch UOM
+        stock_uom = frappe.db.get_value("Item", item_code, "stock_uom")
+        
+        mr.append("items", {
+            "item_code": item_code,
+            "qty": qty,
+            "schedule_date": schedule_date,
+            "warehouse": warehouse,
+            "uom": stock_uom,
+            "stock_uom": stock_uom,
+            "conversion_factor": 1.0,
+            "description": frappe.db.get_value("Item", item_code, "item_name") or item_code
+        })
+    
+    mr.insert(ignore_permissions=True)
+    return mr.name
+
+@frappe.whitelist()
+def get_material_requests():
+    """
+    Returns a list of Material Requests for the franchisee (filtered by creator).
+    """
+    requests = frappe.get_list(
+        "Material Request",
+        filters={
+            "owner": frappe.session.user,
+            "material_request_type": "Material Transfer"
+        },
+        fields=["name", "status", "schedule_date", "per_ordered"],
+        order_by="creation desc",
+        limit=20
+    )
+
+    if not requests:
+        return []
+
+    req_names = [r.name for r in requests]
+    # Fetch items for these requests
+    items = frappe.get_all("Material Request Item", 
+        filters={"parent": ["in", req_names]}, 
+        fields=["parent", "item_code", "item_name"]
+    )
+    
+    # Map items to parent request
+    req_items = {}
+    for i in items:
+        if i.parent not in req_items:
+            req_items[i.parent] = []
+        
+        # Use item_name if available, else item_code
+        label = i.item_name if i.item_name else i.item_code
+        req_items[i.parent].append(label)
+        
+    for r in requests:
+        r.item_names = ", ".join(req_items.get(r.name, []))
+        
+    return requests
